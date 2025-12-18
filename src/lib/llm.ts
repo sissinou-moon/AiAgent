@@ -8,6 +8,28 @@ export interface LLMMessage {
     content: string;
 }
 
+/**
+ * Cleans the LLM output to extract a valid JSON string.
+ */
+function cleanJSON(content: string): string {
+    // 1. Remove markdown code blocks if present
+    let cleaned = content.replace(/```json\s?([\s\S]*?)```/g, '$1');
+    cleaned = cleaned.replace(/```\s?([\s\S]*?)```/g, '$1');
+
+    // 2. Remove leading/trailing whitespace
+    cleaned = cleaned.trim();
+
+    // 3. Handle problematic characters (raw newlines in strings)
+    // This is a common issue where the model doesn't escape newlines.
+    // We attempt to fix common cases where a newline is inside a string value.
+    // Note: This regex is a heuristic and might fail for complex nested structures.
+    // We look for a newline that is NOT followed by a "key": "value" pattern or a closing bracket.
+    // However, it's safer to try to rely on the agent's updated prompt first.
+    // For now, let's just do basic cleaning of markdown junk.
+
+    return cleaned;
+}
+
 export async function callLLM(messages: LLMMessage[], retryCount: number = 0, model: string = DEFAULT_MODEL): Promise<AgentResponse> {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
@@ -44,12 +66,14 @@ export async function callLLM(messages: LLMMessage[], retryCount: number = 0, mo
             throw new Error('LLM returned empty content.');
         }
 
+        const cleanedContent = cleanJSON(content);
+
         try {
-            const json = JSON.parse(content);
+            const json = JSON.parse(cleanedContent);
             // Validate against our schema
             return AgentResponseSchema.parse(json);
         } catch (parseError) {
-            console.error('Failed to parse LLM response as valid JSON:', content);
+            console.error('Failed to parse LLM response as valid JSON:', cleanedContent);
 
             if (retryCount < 3) {
                 console.log(`Retrying LLM call (Attempt ${retryCount + 1}/3) due to validation error: ${parseError}`);
