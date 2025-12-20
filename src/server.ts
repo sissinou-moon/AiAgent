@@ -1,7 +1,7 @@
 import app, { printRoutes } from './app';
 import { SANDBOX_ROOT } from './config';
 
-const PORT = parseInt(process.env.PORT || '3000');
+const PORT = parseInt(process.env.PORT || '4000');
 
 const start = async () => {
     try {

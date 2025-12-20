@@ -14,10 +14,11 @@ export class SandboxError extends Error {
  * Resolves a relative path to a safe absolute path within the sandbox.
  * Throws if the path escapes the sandbox.
  */
-function resolveSafePath(relativePath: string): string {
-    const safePath = path.resolve(SANDBOX_ROOT, relativePath);
-    if (!safePath.startsWith(SANDBOX_ROOT)) {
-        throw new SandboxError(`Security Violation: Path ${relativePath} traverses outside the sandbox.`);
+function resolveSafePath(relativePath: string, sandboxOverride?: string): string {
+    const root = sandboxOverride || SANDBOX_ROOT;
+    const safePath = path.resolve(root, relativePath);
+    if (!safePath.startsWith(root)) {
+        throw new SandboxError(`Security Violation: Path ${relativePath} traverses outside the sandbox (${root}).`);
     }
     return safePath;
 }
@@ -27,8 +28,8 @@ function normalizeQuotes(str: string): string {
     return str.replace(/['’`“"”]/g, "'");
 }
 
-async function findPathWithLooseQuotes(fullPath: string): Promise<string> {
-    const safePath = resolveSafePath(fullPath);
+async function findPathWithLooseQuotes(fullPath: string, sandboxOverride?: string): Promise<string> {
+    const safePath = resolveSafePath(fullPath, sandboxOverride);
     if (await fs.pathExists(safePath)) {
         return safePath;
     }
@@ -52,28 +53,28 @@ async function findPathWithLooseQuotes(fullPath: string): Promise<string> {
     return safePath;
 }
 
-export async function executeOperation(operation: FileOperation): Promise<any> {
+export async function executeOperation(operation: FileOperation, sandboxOverride?: string): Promise<any> {
     try {
         switch (operation.op) {
             case 'write': {
-                const target = resolveSafePath(operation.path);
+                const target = resolveSafePath(operation.path, sandboxOverride);
                 await fs.ensureDir(path.dirname(target));
                 await fs.writeFile(target, operation.content, 'utf-8');
                 return { status: 'success', path: operation.path, op: 'write' };
             }
             case 'read': {
-                const target = await findPathWithLooseQuotes(operation.path);
+                const target = await findPathWithLooseQuotes(operation.path, sandboxOverride);
                 if (!await fs.pathExists(target)) throw new SandboxError(`File not found: ${operation.path}`);
                 const content = await fs.readFile(target, 'utf-8');
                 return { status: 'success', content, path: operation.path, op: 'read' };
             }
             case 'mkdir': {
-                const target = resolveSafePath(operation.path);
+                const target = resolveSafePath(operation.path, sandboxOverride);
                 await fs.ensureDir(target);
                 return { status: 'success', path: operation.path, op: 'mkdir' };
             }
             case 'delete': {
-                const target = await findPathWithLooseQuotes(operation.path);
+                const target = await findPathWithLooseQuotes(operation.path, sandboxOverride);
                 // EBUSY Retry Logic
                 let retries = 3;
                 while (retries > 0) {
@@ -93,23 +94,23 @@ export async function executeOperation(operation: FileOperation): Promise<any> {
             }
             case 'move': {
                 // Source should use smart lookup
-                const src = await findPathWithLooseQuotes(operation.from);
+                const src = await findPathWithLooseQuotes(operation.from, sandboxOverride);
                 // Dest should be exact
-                const dest = resolveSafePath(operation.to);
+                const dest = resolveSafePath(operation.to, sandboxOverride);
 
                 await fs.ensureDir(path.dirname(dest));
                 await fs.move(src, dest, { overwrite: true });
                 return { status: 'success', from: operation.from, to: operation.to, op: 'move' };
             }
             case 'copy': {
-                const src = await findPathWithLooseQuotes(operation.from);
-                const dest = resolveSafePath(operation.to);
+                const src = await findPathWithLooseQuotes(operation.from, sandboxOverride);
+                const dest = resolveSafePath(operation.to, sandboxOverride);
                 await fs.ensureDir(path.dirname(dest));
                 await fs.copy(src, dest, { overwrite: true });
                 return { status: 'success', from: operation.from, to: operation.to, op: 'copy' };
             }
             case 'list': {
-                const target = await findPathWithLooseQuotes(operation.path);
+                const target = await findPathWithLooseQuotes(operation.path, sandboxOverride);
                 if (!await fs.pathExists(target)) throw new SandboxError(`Directory not found: ${operation.path}`);
 
                 const allFiles = await fs.readdir(target);
@@ -124,8 +125,8 @@ export async function executeOperation(operation: FileOperation): Promise<any> {
             }
             case 'move_all': {
                 // move_all usually operates on a directory, smart lookup logic applies to the dir path
-                const srcDir = await findPathWithLooseQuotes(operation.path);
-                const destDir = resolveSafePath(operation.destination);
+                const srcDir = await findPathWithLooseQuotes(operation.path, sandboxOverride);
+                const destDir = resolveSafePath(operation.destination, sandboxOverride);
 
                 if (!await fs.pathExists(srcDir)) throw new SandboxError(`Source directory not found: ${operation.path}`);
                 await fs.ensureDir(destDir);

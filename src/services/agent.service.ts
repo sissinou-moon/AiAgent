@@ -42,7 +42,7 @@ Available Operations: write, read, mkdir, delete, list, move, copy, remember, re
 `;
 
 export class AgentService {
-    static async runAutonomous(task: string, maxTurns: number = 3, history: LLMMessage[] = []): Promise<any> {
+    static async runAutonomous(task: string, maxTurns: number = 3, history: LLMMessage[] = [], sandboxPath?: string): Promise<any> {
         let currentHistory = [...history];
         let aggregatedResults = [];
         let currentTask = task;
@@ -50,7 +50,7 @@ export class AgentService {
         for (let i = 0; i < maxTurns; i++) {
             console.log(`\n=== Turn ${i + 1}/${maxTurns} ===`);
 
-            const result = await this.processTask(currentTask, currentHistory);
+            const result = await this.processTask(currentTask, currentHistory, sandboxPath);
             aggregatedResults.push({ turn: i + 1, ...result });
 
             if (result.status === 'error' || !result.results || result.results.length === 0) {
@@ -89,7 +89,7 @@ export class AgentService {
         };
     }
 
-    static async processTask(task: string, history: LLMMessage[] = []): Promise<any> {
+    static async processTask(task: string, history: LLMMessage[] = [], sandboxPath?: string): Promise<any> {
         const memory = await MemoryService.init();
         const vectorStore = await VectorStore.init();
 
@@ -99,7 +99,7 @@ export class AgentService {
         const recentChat = await memory.getRecentConversation(10);
 
         const messages: LLMMessage[] = [
-            { role: 'system', content: this.getEnhancedPrompt(longTermMemory, recentActions, recentChat) },
+            { role: 'system', content: this.getEnhancedPrompt(longTermMemory, recentActions, recentChat, sandboxPath) },
             ...history,
             { role: 'user', content: task }
         ];
@@ -109,7 +109,7 @@ export class AgentService {
             await memory.addMessage('assistant', JSON.stringify(agentResponse));
 
             // EXECUTOR: Parallel processing for independent tasks
-            const results = await this.executeBatch(agentResponse.operations, memory, vectorStore);
+            const results = await this.executeBatch(agentResponse.operations, memory, vectorStore, sandboxPath);
 
             return {
                 thought: agentResponse.thought,
@@ -123,7 +123,7 @@ export class AgentService {
         }
     }
 
-    private static async executeBatch(operations: FileOperation[], memory: MemoryService, vectorStore: VectorStore): Promise<any[]> {
+    private static async executeBatch(operations: FileOperation[], memory: MemoryService, vectorStore: VectorStore, sandboxPath?: string): Promise<any[]> {
         return Promise.all(operations.map(async (op) => {
             console.log(`Executing op: ${op.op}`);
             let result;
@@ -144,18 +144,19 @@ export class AgentService {
                         result = { status: 'success', matches, op: 'semantic_search' };
                         break;
                     case 'generate_template':
-                        const files = await TemplateService.generate(op.templateName, op.targetDir, op.variables as Record<string, string>);
+                        const actualTargetDir = op.targetDir ? (sandboxPath ? path.join(sandboxPath, op.targetDir) : path.join(SANDBOX_ROOT, op.targetDir)) : (sandboxPath || SANDBOX_ROOT);
+                        const files = await TemplateService.generate(op.templateName, actualTargetDir, op.variables as Record<string, string>);
                         result = { status: 'success', files, op: 'generate_template' };
                         break;
                     case 'plan_proposal':
                         result = { status: 'success', proposal: op, message: "Plan registered. Awaiting your approval to proceed with execution or feedback.", op: 'plan_proposal' };
                         break;
                     case 'index_files':
-                        await this.reindexSandbox(vectorStore);
+                        await this.reindexSandbox(vectorStore, sandboxPath);
                         result = { status: 'success', message: "Indexing complete.", op: 'index_files' };
                         break;
                     default:
-                        result = await executeOperation(op as any);
+                        result = await executeOperation(op as any, sandboxPath);
                         // Update index if it's a 'write' operation
                         if (op.op === 'write') {
                             try {
@@ -179,12 +180,13 @@ export class AgentService {
         }));
     }
 
-    private static async reindexSandbox(vectorStore: VectorStore) {
-        if (!fs.existsSync(SANDBOX_ROOT)) return;
-        const files = await this.getAllFiles(SANDBOX_ROOT);
+    private static async reindexSandbox(vectorStore: VectorStore, sandboxPath?: string) {
+        const root = sandboxPath || SANDBOX_ROOT;
+        if (!fs.existsSync(root)) return;
+        const files = await this.getAllFiles(root);
         for (const file of files) {
             try {
-                const relativePath = path.relative(SANDBOX_ROOT, file);
+                const relativePath = path.relative(root, file);
                 const content = await fs.readFile(file, 'utf-8');
                 const embedding = await generateEmbedding(content);
                 await vectorStore.upsert({
@@ -207,11 +209,12 @@ export class AgentService {
         return Array.prototype.concat(...files);
     }
 
-    private static getEnhancedPrompt(memories: any, actions: any, chat: any): string {
+    private static getEnhancedPrompt(memories: any, actions: any, chat: any, sandboxPath?: string): string {
+        const activeSandbox = sandboxPath || SANDBOX_ROOT;
         return `${SYSTEM_PROMPT}
 
 === OPERATIONAL CONTEXT ===
-**Sandbox Root**: \`${SANDBOX_ROOT}\`
+**Sandbox Root**: \`${activeSandbox}\`
 
 === MEMORY CONTEXT ===
 [Recent Actions]
