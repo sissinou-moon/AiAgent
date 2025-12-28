@@ -7,6 +7,7 @@ import { SANDBOX_ROOT } from '../config';
 import { VectorStore } from '../lib/vector';
 import { TemplateService } from '../lib/templates';
 import { generateEmbedding } from '../lib/embeddings';
+import { jsonToToon } from '../lib/toon';
 import path from 'path';
 import fs from 'fs-extra';
 
@@ -96,7 +97,7 @@ export class AgentService {
                 });
                 currentHistory.push({
                     role: 'user',
-                    content: `Operation Results: ${JSON.stringify(results)}\n\nProceed.`
+                    content: `Operation Results:\n${jsonToToon(results)}\n\nProceed.`
                 });
 
                 currentTask = "Check the 'Operation Results'. Continue if needed, otherwise finish.";
@@ -133,7 +134,7 @@ export class AgentService {
 
             currentHistory.push({
                 role: 'user',
-                content: `Operation Results: ${JSON.stringify(result.results)}\n\nProceed with the next step.`
+                content: `Operation Results:\n${jsonToToon(result.results)}\n\nProceed with the next step.`
             });
 
             if (i < maxTurns - 1) {
@@ -271,13 +272,13 @@ export class AgentService {
 
 === MEMORY CONTEXT ===
 [Recent Actions]
-${JSON.stringify(actions.map((a: any) => ({ op: a.operation.op, status: a.result?.status || 'unknown' })), null, 2)}
+${jsonToToon(actions.map((a: any) => ({ op: a.operation.op, status: a.result?.status || 'unknown' })))}
 
 [Chat History]
 ${chat.map((c: any) => `${c.role.toUpperCase()}: ${c.content}`).join('\n')}
 
 [Fast Retrieval Knowledge]
-${JSON.stringify(memories, null, 2)}
+${jsonToToon(memories)}
 `;
     }
 }
