@@ -1,33 +1,26 @@
 import { AgentResponse, AgentResponseSchema } from '../types';
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const DEFAULT_MODEL = 'xiaomi/mimo-v2-flash:free'; // Using a free model as requested
+const DEFAULT_MODEL = 'xiaomi/mimo-v2-flash:free'; // Using DeepSeek R1 (free version if available) as it has native reasoning
 
 export interface LLMMessage {
     role: 'system' | 'user' | 'assistant';
     content: string;
 }
 
+export interface StreamChunk {
+    type: 'thought' | 'message' | 'reasoning' | 'done';
+    content?: string;
+    fullResponse?: AgentResponse;
+}
+
 /**
  * Cleans the LLM output to extract a valid JSON string.
  */
 function cleanJSON(content: string): string {
-    // 1. Remove markdown code blocks if present
     let cleaned = content.replace(/```json\s?([\s\S]*?)```/g, '$1');
     cleaned = cleaned.replace(/```\s?([\s\S]*?)```/g, '$1');
-
-    // 2. Remove leading/trailing whitespace
-    cleaned = cleaned.trim();
-
-    // 3. Handle problematic characters (raw newlines in strings)
-    // This is a common issue where the model doesn't escape newlines.
-    // We attempt to fix common cases where a newline is inside a string value.
-    // Note: This regex is a heuristic and might fail for complex nested structures.
-    // We look for a newline that is NOT followed by a "key": "value" pattern or a closing bracket.
-    // However, it's safer to try to rely on the agent's updated prompt first.
-    // For now, let's just do basic cleaning of markdown junk.
-
-    return cleaned;
+    return cleaned.trim();
 }
 
 export async function callLLM(messages: LLMMessage[], retryCount: number = 0, model: string = DEFAULT_MODEL): Promise<AgentResponse> {
@@ -39,7 +32,7 @@ export async function callLLM(messages: LLMMessage[], retryCount: number = 0, mo
     const payload = {
         model,
         messages,
-        response_format: { type: 'json_object' }, // Force JSON mode
+        response_format: { type: 'json_object' },
     };
 
     try {
@@ -48,7 +41,7 @@ export async function callLLM(messages: LLMMessage[], retryCount: number = 0, mo
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${apiKey}`,
-                'HTTP-Referer': 'https://github.com/Start-Loop/AiAgent', // Required by OpenRouter for free tier
+                'HTTP-Referer': 'https://github.com/Start-Loop/AiAgent',
                 'X-Title': 'AiAgent FS Controller',
             },
             body: JSON.stringify(payload),
@@ -70,29 +63,108 @@ export async function callLLM(messages: LLMMessage[], retryCount: number = 0, mo
 
         try {
             const json = JSON.parse(cleanedContent);
-            // Validate against our schema
-            return AgentResponseSchema.parse(json);
-        } catch (parseError) {
-            console.error('Failed to parse LLM response as valid JSON:', cleanedContent);
-
-            if (retryCount < 3) {
-                console.log(`Retrying LLM call (Attempt ${retryCount + 1}/3) due to validation error: ${parseError}`);
-                const errorMessage = `Your previous response was invalid. Error: ${parseError instanceof Error ? parseError.message : String(parseError)}. Please correct your JSON format and ensure it matches the schema strictly.`;
-
-                const newMessages = [
-                    ...messages,
-                    { role: 'assistant', content } as LLMMessage,
-                    { role: 'user', content: errorMessage } as LLMMessage
-                ];
-
-                return callLLM(newMessages, retryCount + 1);
+            const parsed = AgentResponseSchema.parse(json);
+            if (data.usage) {
+                parsed.usage = data.usage;
             }
-
-            throw new Error(`Invalid JSON response from LLM after retires: ${parseError}`);
+            return parsed;
+        } catch (parseError) {
+            if (retryCount < 3) {
+                const errorMessage = `Your previous response was invalid JSON. Error: ${parseError instanceof Error ? parseError.message : String(parseError)}. Please ensure you return valid JSON.`;
+                return callLLM([...messages, { role: 'assistant', content }, { role: 'user', content: errorMessage }], retryCount + 1);
+            }
+            throw new Error(`Invalid JSON response after retries: ${parseError}`);
         }
-
     } catch (error) {
         console.error('LLM Call Failed:', error);
         throw error;
+    }
+}
+
+export async function* callLLMStream(messages: LLMMessage[], model: string = DEFAULT_MODEL): AsyncGenerator<StreamChunk> {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+        throw new Error('OPENROUTER_API_KEY is not set.');
+    }
+
+    const response = await fetch(OPENROUTER_API_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'HTTP-Referer': 'https://github.com/Start-Loop/AiAgent',
+            'X-Title': 'AiAgent FS Controller',
+        },
+        body: JSON.stringify({
+            model,
+            messages,
+            stream: true,
+            stream_options: { include_usage: true },
+            // DeepSeek R1 on OpenRouter supports reasoning tokens which are often sent in a separate field or before content
+            include_reasoning: true
+        }),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`OpenRouter API Error: ${response.status} - ${errorText}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Response body is empty');
+
+    const decoder = new TextDecoder();
+    let accumulatedContent = '';
+    let accumulatedReasoning = '';
+    let usage: any = undefined;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6);
+                if (dataStr === '[DONE]') continue;
+
+                try {
+                    const data = JSON.parse(dataStr);
+                    const delta = data.choices[0]?.delta;
+
+                    if (delta?.reasoning) {
+                        accumulatedReasoning += delta.reasoning;
+                        yield { type: 'reasoning', content: delta.reasoning };
+                    }
+
+                    if (delta?.content) {
+                        accumulatedContent += delta.content;
+                        // We yield 'message' for the content stream
+                        yield { type: 'message', content: delta.content };
+                    }
+                    if (data.usage) {
+                        usage = data.usage;
+                    }
+                } catch (e) {
+                    // Ignore parse errors for incomplete chunks
+                }
+            }
+        }
+    }
+
+    // After stream ends, try to parse the whole content as JSON if it's supposed to be an AgentResponse
+    try {
+        const cleaned = cleanJSON(accumulatedContent);
+        const json = JSON.parse(cleaned);
+        const parsed = AgentResponseSchema.parse(json);
+        if (usage) {
+            parsed.usage = usage;
+        }
+        yield { type: 'done', fullResponse: parsed };
+    } catch (e) {
+        // If it's not valid JSON, we still yield done but without fullResponse
+        yield { type: 'done' };
     }
 }

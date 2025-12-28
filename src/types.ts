@@ -78,10 +78,19 @@ export const FileOperationSchema = z.discriminatedUnion('op', [
 export type FileOperation = z.infer<typeof FileOperationSchema>;
 
 // Agent response schema
+export const TokenUsageSchema = z.object({
+    prompt_tokens: z.number(),
+    completion_tokens: z.number(),
+    total_tokens: z.number(),
+});
+
+export type TokenUsage = z.infer<typeof TokenUsageSchema>;
+
 export const AgentResponseSchema = z.object({
     thought: z.string().describe('Your internal reasoning and planning.'),
     message: z.string().optional().describe('Direct communication or answer to the user.'),
     operations: z.array(FileOperationSchema).describe('List of operations to execute'),
+    usage: TokenUsageSchema.optional().describe('Token usage for the request'),
 });
 
 export type AgentResponse = z.infer<typeof AgentResponseSchema>;

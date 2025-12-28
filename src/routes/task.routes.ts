@@ -17,15 +17,48 @@ const TaskSchema = z.object({
 router.post('/task', async (req: Request, res: Response) => {
     try {
         const body = TaskSchema.parse(req.body);
-        // We will now call a looped version
         const result = await AgentService.runAutonomous(body.task, body.max_turns, body.history as any, body.sandboxPath);
         res.json(result);
     } catch (error: any) {
         if (error instanceof z.ZodError) {
-            res.status(400).json({ error: 'Validation Error', details: (error as any).errors });
+            res.status(400).json({ error: 'Validation Error', details: error.issues });
+        } else {
+            res.status(500).json({ error: error.message || 'Internal Server Error' });
+        }
+    }
+});
+
+router.post('/task/stream', async (req: Request, res: Response) => {
+    try {
+        const body = TaskSchema.parse(req.body);
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const stream = AgentService.runAutonomousStream(
+            body.task,
+            body.max_turns,
+            body.history as any,
+            body.sandboxPath
+        );
+
+        for await (const event of stream) {
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+
+        res.end();
+    } catch (error: any) {
+        if (error instanceof z.ZodError) {
+            res.status(400).json({ error: 'Validation Error', details: error.issues });
         } else {
             console.error(error);
-            res.status(500).json({ error: error.message || 'Internal Server Error' });
+            if (!res.headersSent) {
+                res.status(500).json({ error: error.message || 'Internal Server Error' });
+            } else {
+                res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
+                res.end();
+            }
         }
     }
 });

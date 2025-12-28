@@ -1,4 +1,4 @@
-import { callLLM, LLMMessage } from '../lib/llm';
+import { callLLM, callLLMStream, LLMMessage, StreamChunk } from '../lib/llm';
 import { executeOperation } from '../lib/sandbox';
 import { AgentResponse, FileOperation } from '../types';
 import { MemoryService } from '../lib/memory';
@@ -11,22 +11,19 @@ import path from 'path';
 import fs from 'fs-extra';
 
 const SYSTEM_PROMPT = `
-You are an ELITE AI Software Engineer and file system agent. 
-Your goal is to build high-quality, performant, and clean code systems.
+You are an ELITE AI Software Engineer and file system agent with ADVANCED REASONING capabilities. 
 
 OPERATIONAL PROTOCOLS:
-1. **PLAN BEFORE EXECUTE**: For any task involving more than 2 files or complex logic, you MUST first use the \`plan_proposal\` operation.
-2. **PARALLEL MINDSET**: You can execute multiple independent operations at once. Group them in the \`operations\` array.
-3. **QUALITY FIRST**: 
+1. **DEEP THINKING**: Before every action, you must engage in deep reasoning. Analyze the task, consider edge cases, and plan the most efficient implementation.
+2. **PLAN BEFORE EXECUTE**: For any task involving more than 2 files or complex logic, you MUST first use the \`plan_proposal\` operation.
+3. **PARALLEL MINDSET**: You can execute multiple independent operations at once. Group them in the \`operations\` array.
+4. **QUALITY FIRST**: 
    - Follow DRY (Don't Repeat Yourself) and SOLID principles.
    - Write clean, documented, and idiomatic code.
    - Reference best practices for the specific language/framework requested.
-4. **SEMANTIC SEARCH**: Use \`semantic_search\` when you need to find code by functionality rather than just filename.
-5. **SCAFFOLDING**: Use \`generate_template\` for standardized project structures to ensure consistency and quality.
-6. **FINISH**: When you have completed the user's request, you MUST return an empty \`operations\` array or a final \`thought\` indicating completion. Do NOT execute unnecessary operations just to fill turns.
-7. **PLAN EXECUTION**: If you have previously proposed a plan and the user approves it (e.g., "Looks good", "Proceed"), you MUST immediately start executing the steps of that plan. Do not ask for further instructions if the path forward is already planned and approved.
-8. **COMMUNICATION**: Use the \`message\` field to speak directly to the user, provide answers to questions, or summarize what you've done.
-9. **JSON FORMATTING**: CRITICAL: Your entire response MUST be a single, valid JSON object. Escape all newlines in string values as \`\\n\`. Do NOT include raw newlines within JSON string values.
+5. **SEMANTIC SEARCH**: Use \`semantic_search\` when you need to find code by functionality rather than just filename.
+6. **FINISH**: When you have completed the user's request, return an empty \`operations\` array or a final \`thought\` indicating completion.
+7. **JSON FORMATTING**: CRITICAL: Your entire response MUST be a single, valid JSON object. Escape all newlines in string values as \`\\n\`.
 
 JSON RESPONSE FORMAT:
 {
@@ -42,14 +39,82 @@ Available Operations: write, read, mkdir, delete, list, move, copy, remember, re
 `;
 
 export class AgentService {
+    static async *runAutonomousStream(task: string, maxTurns: number = 3, history: LLMMessage[] = [], sandboxPath?: string): AsyncGenerator<any> {
+        let currentHistory = [...history];
+        let aggregatedResults = [];
+        let currentTask = task;
+
+        const memory = await MemoryService.init();
+        const vectorStore = await VectorStore.init();
+
+        for (let i = 0; i < maxTurns; i++) {
+            yield { type: 'turn_start', turn: i + 1 };
+
+            const longTermMemory = await memory.getAllLongTermMemories();
+            const recentActions = await memory.getRecentActions(10);
+            const recentChat = await memory.getRecentConversation(10);
+
+            const messages: LLMMessage[] = [
+                { role: 'system', content: this.getEnhancedPrompt(longTermMemory, recentActions, recentChat, sandboxPath) },
+                ...currentHistory,
+                { role: 'user', content: currentTask }
+            ];
+
+            let lastResponse: AgentResponse | undefined;
+
+            for await (const chunk of callLLMStream(messages)) {
+                if (chunk.type === 'reasoning') {
+                    yield { type: 'thinking', content: chunk.content };
+                } else if (chunk.type === 'message') {
+                    yield { type: 'chunk', content: chunk.content };
+                } else if (chunk.type === 'done' && chunk.fullResponse) {
+                    lastResponse = chunk.fullResponse;
+                }
+            }
+
+            if (!lastResponse) {
+                yield { type: 'error', message: 'Failed to get valid response from LLM.' };
+                break;
+            }
+
+            yield { type: 'thought', content: lastResponse.thought };
+            yield { type: 'message', content: lastResponse.message };
+
+            if (lastResponse.usage) {
+                yield { type: 'usage', content: lastResponse.usage };
+            }
+
+            if (lastResponse.operations.length > 0) {
+                yield { type: 'operations_start', count: lastResponse.operations.length };
+                const results = await this.executeBatch(lastResponse.operations, memory, vectorStore, sandboxPath);
+                yield { type: 'operations_results', results };
+
+                // Update history
+                currentHistory.push({
+                    role: 'assistant',
+                    content: JSON.stringify(lastResponse)
+                });
+                currentHistory.push({
+                    role: 'user',
+                    content: `Operation Results: ${JSON.stringify(results)}\n\nProceed.`
+                });
+
+                currentTask = "Check the 'Operation Results'. Continue if needed, otherwise finish.";
+            } else {
+                yield { type: 'done', final_message: lastResponse.message || "Task completed." };
+                return;
+            }
+        }
+
+        yield { type: 'done', final_message: "Max turns reached or task completed." };
+    }
+
     static async runAutonomous(task: string, maxTurns: number = 3, history: LLMMessage[] = [], sandboxPath?: string): Promise<any> {
         let currentHistory = [...history];
         let aggregatedResults = [];
         let currentTask = task;
 
         for (let i = 0; i < maxTurns; i++) {
-            console.log(`\n=== Turn ${i + 1}/${maxTurns} ===`);
-
             const result = await this.processTask(currentTask, currentHistory, sandboxPath);
             aggregatedResults.push({ turn: i + 1, ...result });
 
@@ -57,7 +122,6 @@ export class AgentService {
                 break;
             }
 
-            // 1. Add Assistant Action
             currentHistory.push({
                 role: 'assistant',
                 content: JSON.stringify({
@@ -67,11 +131,9 @@ export class AgentService {
                 })
             });
 
-            // 2. Add System Output
-            const toolOutput = JSON.stringify(result.results);
             currentHistory.push({
                 role: 'user',
-                content: `Operation Results: ${toolOutput}\n\nProceed with the next step.`
+                content: `Operation Results: ${JSON.stringify(result.results)}\n\nProceed with the next step.`
             });
 
             if (i < maxTurns - 1) {
@@ -81,10 +143,20 @@ export class AgentService {
 
         const isDone = aggregatedResults.length < maxTurns || aggregatedResults[aggregatedResults.length - 1].results.length === 0;
 
+        const totalUsage = aggregatedResults.reduce((acc, turn) => {
+            if (turn.usage) {
+                acc.prompt_tokens += turn.usage.prompt_tokens;
+                acc.completion_tokens += turn.usage.completion_tokens;
+                acc.total_tokens += turn.usage.total_tokens;
+            }
+            return acc;
+        }, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+
         return {
             status: 'success',
             turns_executed: aggregatedResults.length,
             final_message: isDone ? "Task completed successfully." : "Max turns reached.",
+            total_usage: totalUsage,
             history: aggregatedResults
         };
     }
@@ -93,7 +165,6 @@ export class AgentService {
         const memory = await MemoryService.init();
         const vectorStore = await VectorStore.init();
 
-        // Retrieve Context
         const longTermMemory = await memory.getAllLongTermMemories();
         const recentActions = await memory.getRecentActions(10);
         const recentChat = await memory.getRecentConversation(10);
@@ -107,27 +178,23 @@ export class AgentService {
         try {
             const agentResponse: AgentResponse = await callLLM(messages);
             await memory.addMessage('assistant', JSON.stringify(agentResponse));
-
-            // EXECUTOR: Parallel processing for independent tasks
             const results = await this.executeBatch(agentResponse.operations, memory, vectorStore, sandboxPath);
 
             return {
                 thought: agentResponse.thought,
                 message: agentResponse.message,
-                results: results
+                results: results,
+                usage: agentResponse.usage
             };
 
         } catch (error: any) {
-            console.error("Agent Error:", error);
             return { status: 'error', error: error.message };
         }
     }
 
     private static async executeBatch(operations: FileOperation[], memory: MemoryService, vectorStore: VectorStore, sandboxPath?: string): Promise<any[]> {
         return Promise.all(operations.map(async (op) => {
-            console.log(`Executing op: ${op.op}`);
             let result;
-
             try {
                 switch (op.op) {
                     case 'remember':
@@ -149,7 +216,7 @@ export class AgentService {
                         result = { status: 'success', files, op: 'generate_template' };
                         break;
                     case 'plan_proposal':
-                        result = { status: 'success', proposal: op, message: "Plan registered. Awaiting your approval to proceed with execution or feedback.", op: 'plan_proposal' };
+                        result = { status: 'success', proposal: op, message: "Plan registered. Awaiting approval.", op: 'plan_proposal' };
                         break;
                     case 'index_files':
                         await this.reindexSandbox(vectorStore, sandboxPath);
@@ -157,24 +224,16 @@ export class AgentService {
                         break;
                     default:
                         result = await executeOperation(op as any, sandboxPath);
-                        // Update index if it's a 'write' operation
                         if (op.op === 'write') {
                             try {
                                 const embedding = await generateEmbedding(op.content);
-                                await vectorStore.upsert({
-                                    path: op.path,
-                                    embedding,
-                                    metadata: { lastModified: Date.now() }
-                                });
-                            } catch (e) {
-                                console.warn("Failed to update index for write operation:", e);
-                            }
+                                await vectorStore.upsert({ path: op.path, embedding, metadata: { lastModified: Date.now() } });
+                            } catch (e) { }
                         }
                 }
             } catch (err: any) {
                 result = { status: 'error', error: err.message, op: op.op };
             }
-
             await memory.logAction(op, result);
             return result;
         }));
@@ -189,14 +248,8 @@ export class AgentService {
                 const relativePath = path.relative(root, file);
                 const content = await fs.readFile(file, 'utf-8');
                 const embedding = await generateEmbedding(content);
-                await vectorStore.upsert({
-                    path: relativePath,
-                    embedding,
-                    metadata: { lastModified: Date.now() }
-                });
-            } catch (e) {
-                console.warn(`Failed to index file ${file}:`, e);
-            }
+                await vectorStore.upsert({ path: relativePath, embedding, metadata: { lastModified: Date.now() } });
+            } catch (e) { }
         }
     }
 
